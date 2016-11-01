@@ -1,0 +1,320 @@
+#!/bin/bash
+
+welcom () {
+echo -e "\033[1;37m"
+echo "-=# Redis Sharded Cluster Management #=-"
+echo -e "\033[0m"
+}
+
+[ -f $(dirname $0)/redis-cluster.conf ] && source $(dirname $0)/redis-cluster.conf
+[ -f $(dirname $0)/infra.conf ] && source $(dirname $0)/infra.conf
+
+usage () {
+    echo "Usage: $(basename $0) <command>"
+    cat <<-EOT
+
+Commands:
+
+    help		display this help and exit
+    list		show list of running redis nodes
+    create [ec2type]	create main cluster node (with EC2 type if cpecified)
+    addnode [ec2type]	add new redis node (with EC2 type if cpecified)
+    delnode <node_name>	gracefully remove node from cluster and terminate it
+    status		show Redis Sharded cluster status
+
+EOT
+}
+
+die () {
+    echo -e "ERROR: $1"; echo; exit 1
+}
+
+check_params () {
+    param_list=(vpc_id aws_access_key_id aws_secret_access_key aws_region ec2type use_private_subnets key_name secgroup_name disk_size route53_zoneid route53_domain key_file bastion)
+    local errors=0
+    for i in "${param_list[@]}"; do
+        if [ -z "${!i}" ]; then echo "Please set parametr \"$i\""; errors=1; fi
+    done
+    if [ $errors -ne 0 ]; then die "Check your config file"; fi
+    export AWS_ACCESS_KEY_ID=$aws_access_key_id
+    export AWS_SECRET_ACCESS_KEY=$aws_secret_access_key
+    export AWS_DEFAULT_REGION=$aws_region
+}
+
+check_credentials () {
+    local vpc=`aws ec2 describe-vpcs`
+    [ $? -ne 0 ] && die "No access to AWS! Check credentials in config file"
+    [ -z `echo $vpc | jq ".[\"Vpcs\"]|.[]| select(.VpcId == \"$vpc_id\")|.VpcId"` ] && die "VPC with id \"$vpc_id\" not found! Check your config file"
+    [ -z `aws ec2 describe-key-pairs | jq ".[][]|select(.KeyName == \"$key_name\")|.KeyName"` ] && die "Key-pair with name \"$key_name\" not found! Check your config file"
+    [ -z `get_secgr_id` ] && die "Security group with name \"$secgroup_name\" not found! Check your config file"
+}
+
+check_utils () {
+    [ -z $(which jq) ] && die "Command-line JSON processor not found! Please install it by \033[1;37msudo apt-get install jq\033[0m"
+    [ -z $(which aws) ] && die "AWS Command Line Interface not found! Please install it by \033[1;37msudo pip install awscli\033[0m"
+    [ -z $(which column) ] && die "Columnate utility not found! Please unstall it by \033[1;37msudo apt-get install bsdmainutils\033[0m"
+}
+
+get_aws_data () {
+    aws_subnets=`aws ec2 describe-subnets --filters "[{\"Name\": \"vpc-id\", \"Values\": [\"$vpc_id\"]}, {\"Name\": \"state\", \"Values\": [\"available\"]}]"`
+    aws_instances=`aws ec2 describe-instances --filters "Name=vpc-id,Values=$vpc_id" | jq '.[] | .[] | .Instances[]'`
+    [ $(get_subnet) = "null" ] && die "There are no available subnets! Check your config file for option to use private subnets"
+}
+
+list_nodes () {
+    echo $aws_instances | jq  'select(.Tags) | {type: .InstanceType, id: .InstanceId, state: .State.Name, ip: .PrivateIpAddress, tags: .Tags[]} | select(.tags.Key == "Name") | {type, id, state, ip, name: .tags.Value}'
+}
+
+list_redis_nodes () {
+    echo $aws_instances | jq  'select(.Tags) | {type: .InstanceType, id: .InstanceId, state: .State.Name, ip: .PrivateIpAddress, tags: [.Tags[]]} | select(.tags[].Key == "redisnode") |  select(.tags[].Key == "Name") | {type, id, state, ip, tags: .tags[]} | select(.tags.Key == "Name") | {type, id, state, ip, name: .tags.Value}'
+}
+
+
+subnet_count () {
+    if [ $use_private_subnets == 'yes' ]
+      then echo $aws_subnets | jq '[.["Subnets"]|.[]|select(.MapPublicIpOnLaunch == false)]|length'
+      else echo $aws_subnets | jq '[.["Subnets"]|.[]|select(.MapPublicIpOnLaunch == true) ]|length'
+    fi
+}
+
+ec2_count () {
+    list_nodes | jq '"\(.id) \(.name) \(.type) \(.state)"' | wc -l
+}
+
+
+# spread nodes over subnets
+get_subnet () {
+    if [ $use_private_subnets == 'yes' ]
+      then echo $aws_subnets | jq "[.[\"Subnets\"]|.[]|select(.MapPublicIpOnLaunch == false)]| .[0].SubnetId" | tr -d '"'
+      else echo $aws_subnets | jq "[.[\"Subnets\"]|.[]|select(.MapPublicIpOnLaunch == true) ]| .[0].SubnetId" | tr -d '"'
+    fi
+}
+
+get_ami () {
+    curl -sSL http://cloud-images.ubuntu.com/query/trusty/server/released.current.txt \
+    | grep $aws_region | grep amd64 | grep hvm | grep -P "ebs\t" | awk '{print $8}'
+}
+
+get_node_names () {
+    list_nodes | jq '"\(.name)"' | tr -d '"'
+}
+
+get_node_name () {
+    names="$(get_node_names)"
+    local index
+    local name
+    index=0
+    while true; do
+      index=$(expr $index + 1)
+      name=$(printf "redis-cluster-%02i\n" $index)
+      case "${names[@]}" in  *"$name"*) continue ;; esac
+      break
+    done
+    echo $name
+}
+
+get_secgr_id () {
+    aws ec2 describe-security-groups --filters Name=group-name,Values=$secgroup_name Name=vpc-id,Values=$vpc_id --query 'SecurityGroups[*].{Name:GroupId}' | jq '.[].Name' | tr -d '"'
+}
+
+launch () {
+    local newnode
+    local newnode_id
+    local newnode_name
+    local mainnode_ip
+    local ami
+    local type
+    type=$1
+    echo 'Get main node IP addr'
+    mainnode_ip=$(get_redis_ip)
+    [ -z "$mainnode_ip" ] && die "No main node found"
+    echo 'Get new node name'
+    newnode_name=$(get_node_name)
+    echo "Use node name \"$newnode_name\""
+    echo 'Get AMI image id'
+    ami=$(get_ami)
+    [ -z "$ami" ] && die "AMI image not found"
+    echo "Use AMI image \"$ami\" $(aws ec2 describe-images --image-ids $ami | jq '.[][].Name')"
+    echo 'Prepare user-data script'
+    sed \
+        -e "s;%region%;$aws_region;g" \
+        -e "s;%node_name%;$newnode_name;g" \
+        -e "s;%datadog_key%;$datadog_key;g" \
+        -e "s;%redismain%;$mainnode_ip;g" \
+        provision/node.sh.tmpl > provision/userdata
+    echo "Launch new node with EC2 type \"$type\""
+    newnode=$(aws ec2 run-instances \
+        --image-id $ami \
+        --key-name $key_name \
+        --security-group-ids $(get_secgr_id) \
+        --instance-type $type \
+        --subnet-id $(get_subnet) \
+        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$disk_size,\"DeleteOnTermination\":true,\"VolumeType\":\"gp2\"}}]" \
+        --user-data file://provision/userdata)
+    rm -f provision/userdata
+    newnode_id=$(echo $newnode | jq '.Instances[].InstanceId' | tr -d '"')
+    [ -z "$newnode_id" ] && die "Node not lauched!"
+    echo "Node launched! Instance id is \"$newnode_id\", name is \"$newnode_name\""
+    aws ec2 create-tags --resources $newnode_id --tags Key=Name,Value=$newnode_name Key=redisnode,Value=true
+    echo 'New node labeled with tags'
+    echo 'Done'
+    echo
+}
+
+create () {
+    local newnode
+    local newnode_id
+    local newnode_ip
+    local newnode_name
+    local ami
+    local type
+    type=$1
+    newnode_name="redis-cluster-main"
+
+    newnode_id=`list_redis_nodes | jq "select(.name == \"$newnode_name\")| .id" | tr -d '"'`
+    if [ "$newnode_id" ]; then echo "Main node already running"; echo; return 1; fi
+
+    echo 'Get AMI image id'
+    ami=$(get_ami)
+    [ -z "$ami" ] && die "AMI image not found"
+    echo "Use AMI image \"$ami\" $(aws ec2 describe-images --image-ids $ami | jq '.[][].Name')"
+    echo 'Prepare user-data script'
+    sed \
+        -e "s;%region%;$aws_region;g" \
+        -e "s;%node_name%;$newnode_name;g" \
+        -e "s;%datadog_key%;$datadog_key;g" \
+        provision/mainnode.sh.tmpl > provision/userdata
+    echo "Launch main node with EC2 type \"$type\""
+    newnode=$(aws ec2 run-instances \
+        --image-id $ami \
+        --key-name $key_name \
+        --security-group-ids $(get_secgr_id) \
+        --instance-type $type \
+        --subnet-id $(get_subnet) \
+        --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$disk_size,\"DeleteOnTermination\":true,\"VolumeType\":\"gp2\"}}]" \
+        --user-data file://provision/userdata)
+    rm -f provision/userdata
+    newnode_id=$(echo $newnode | jq '.Instances[].InstanceId' | tr -d '"')
+    [ -z "$newnode_id" ] && die "Node not lauched!"
+    echo "Main node launched! Instance id is \"$newnode_id\", name is \"$newnode_name\""
+    aws ec2 create-tags --resources $newnode_id --tags Key=Name,Value=$newnode_name Key=redisnode,Value=true
+    echo 'New node labeled with tags'
+
+    echo "Add/Change DNS record for redis-cluster.$route53_domain"
+    newnode_ip=$(echo $newnode | jq '.Instances[].PrivateIpAddress' | tr -d '"')
+    echo 'Prepare and send Route53 request'
+    sed \
+        -e "s;%action%;UPSERT;g" \
+        -e "s;%ipaddr%;$newnode_ip;g" \
+        -e "s;%domain%;$route53_domain;g" \
+        provision/route53.json.tmpl > provision/route53.json
+    aws route53 change-resource-record-sets --hosted-zone-id $route53_zoneid --change-batch file://provision/route53.json >/dev/null
+    [ $? -ne 0 ] && die "Something wrong with DNS record update"
+    rm -f provision/route53.json
+
+    echo 'Done! Check status and wait while redis cluster appears'
+    echo
+}
+
+
+list_short () {
+    echo 'Listing current redis nodes'; echo
+    echo -e "\033[1;32mRUNNING NODES"
+    (echo 'ID NAME EC2TYPE STATE IP'; (list_redis_nodes | jq '"\(.id) \(.name) \(.type) \(.state) \(.ip)"' | tr -d '"') | sort -k 2) | column -t -e
+    echo -e "\033[0m"
+    echo 'Done'
+}
+
+
+initiate () {
+    echo 'Check utils installed'; check_utils
+    echo 'Check params in config file'; check_params
+    echo 'Check AWS credentials'; check_credentials
+    echo 'Load environment data from AWS'; get_aws_data
+}
+
+terminate () {
+    local node_id
+    local node_ip
+    local mainnode_ip
+    local answer
+    answer="no"
+    echo 'Get instance id'
+    node_id=`list_redis_nodes | jq "select(.name == \"$1\")| .id" | tr -d '"'`
+    if [ -z "$node_id" ]; then echo "Node $1 not found, use command \"list\" to see running nodes"; echo; return 1; fi
+
+    [ "$1" = "redis-cluster-main" ] && [ `list_redis_nodes | jq 'select(.name != "redis-cluster-main")| .id' | tr -d '"' | wc -l` -ne 0 ] && die "There are another cluster nodes! Please stop them before stop main node!"
+
+    echo -n "Ready to terminate node \"$1\" with id \"$node_id\", are you sure? type 'yes' to continue: "; read answer
+    if [ "$answer" == "yes" ]; then
+
+        if [ "$1" != "redis-cluster-main" ]; then
+            echo 'Gracefully remove node from Redis cluster'
+            mainnode_ip=$(get_redis_ip)
+            node_ip=`list_redis_nodes | jq "select(.name == \"$1\")| .ip" | tr -d '"'`
+            MAINNODE=$mainnode_ip  REDISNODE=$node_ip BASTION_HOST=$bastion BASTION_KEY=$key_file ./provision/nodedel.sh
+            [ $? -ne 0 ] && die "Problem with gracefull removing from cluster"
+        fi
+
+        if [ "$1" = "redis-cluster-main" ]; then
+
+
+            echo "Delete DNS record redis-cluster.$route53_domain"
+            node_ip=`list_redis_nodes | jq "select(.name == \"$1\")| .ip" | tr -d '"'`
+            echo 'Prepare and send Route53 request'
+            sed \
+                -e "s;%action%;DELETE;g" \
+                -e "s;%ipaddr%;$node_ip;g" \
+                -e "s;%domain%;$route53_domain;g" \
+                provision/route53.json.tmpl > provision/route53.json
+            aws route53 change-resource-record-sets --hosted-zone-id $route53_zoneid --change-batch file://provision/route53.json >/dev/null
+            [ $? -ne 0 ] && echo "Something wrong with DNS record update"
+            rm -f provision/route53.json
+        fi
+
+        echo 'Terminating EC instance'
+        aws ec2 terminate-instances --instance-ids $node_id >/dev/null 2>&1
+
+        echo 'Done'
+    else
+        echo 'Ok, nothing to do'
+    fi
+}
+
+get_redis_ip () {
+    list_redis_nodes | jq 'select(.name == "redis-cluster-main")| .ip' | tr -d '"'
+}
+
+
+#
+# main
+#
+welcom
+case "$1" in
+    addnode)
+        initiate
+        if [ -z "$2" ]; then launch $ec2type; else launch $2; fi
+        ;;
+    create)
+        initiate
+        if [ -z "$2" ]; then create $ec2type; else create $2; fi
+        ;;
+    list)
+        initiate
+        list_short
+        ;;
+    status)
+        initiate
+        REDISNODE=$(get_redis_ip) BASTION_HOST=$bastion BASTION_KEY=$key_file ./provision/status.sh
+        ;;
+    help)
+        usage
+        ;;
+    delnode)
+        if [ -z "$2" ]; then echo -e "Please specify node name: \033[1;37mredis-cluster rm <name>\033[0m"; echo; else initiate; terminate $2; fi
+        ;;
+    *)
+        echo -e "Use \033[1;37m$(basename $0) help\033[0m to see usage info"
+        echo
+        ;;
+esac

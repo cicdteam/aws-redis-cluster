@@ -1,0 +1,62 @@
+#!/bin/bash
+
+NODE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+REGION=%region%
+NODE_NAME=%node_name%
+REDISMAIN=%redismain%
+
+echo 'Set hostname'
+echo $NODE_NAME | tee /etc/hostname
+echo "$NODE_IP  $NODE_NAME" | tee -a /etc/hosts
+hostname $NODE_NAME
+
+echo 'Update ubuntu and kernel'
+apt-get -qq update >/dev/null 2>&1
+apt-get -yq install build-essential ruby >/dev/null 2>&1
+gem install redis
+echo 'updated'
+
+echo 'Install last stable Redis'
+wget http://download.redis.io/redis-stable.tar.gz
+tar xzf redis-stable.tar.gz
+rm -f redis-stable.tar.gz
+cd redis-stable
+make
+make install
+make clean
+cd utils
+echo  | ./install_server.sh
+
+echo 'Reconfigure Redis server'
+# set maxmemory for Redis to 80% of total memory
+redismem=$((820 * $(grep MemTotal /proc/meminfo | sed 's/.*\( [0-9]* \).*/\1/' | sed 's/[ \r]//')))
+sed -i 's/^# cluster-enabled yes$/cluster-enabled yes/' /etc/redis/6379.conf
+sed -i 's/^# cluster-config-file nodes-6379.conf$/cluster-config-file nodes-6379.conf/' /etc/redis/6379.conf
+sed -i 's/^# cluster-node-timeout 15000$/cluster-node-timeout 5000/' /etc/redis/6379.conf
+sed -i 's/^# cluster-require-full-coverage yes$/cluster-require-full-coverage no/' /etc/redis/6379.conf
+sed -i "s/^bind 127.0.0.1\$/bind $NODE_IP 127.0.0.1/" /etc/redis/6379.conf
+sed -i 's/^save /#save /' /etc/redis/6379.conf
+sed -i "s/^# maxmemory .*/maxmemory $redismem/" /etc/redis/6379.conf
+sed -i 's/^# maxmemory-policy .*/maxmemory-policy volatile-ttl/' /etc/redis/6379.conf
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+sed -i 's#^exit 0$#echo never > /sys/kernel/mm/transparent_hugepage/enabled#' /etc/rc.local
+service redis_6379 restart
+
+cp ../src/redis-trib.rb /bin
+redis-trib.rb info $NODE_IP:6379
+
+while ! redis-cli -h $REDISMAIN info >/dev/null 2>&1 ; do echo 'Waiting for main redis node'; sleep 1; done
+
+sleep 5
+echo 'Join to cluster'
+redis-trib.rb add-node $NODE_IP:6379 $REDISMAIN:6379
+
+sleep 10
+echo 'Rebalance cluster'
+redis-trib.rb rebalance --use-empty-masters --pipeline 100 $REDISMAIN:6379  >/dev/null
+echo 'Rebalanced'
+
+echo 'Cleanup'
+apt-get -y clean >/dev/null
+apt-get -y autoclean >/dev/null
+echo 'Done!'

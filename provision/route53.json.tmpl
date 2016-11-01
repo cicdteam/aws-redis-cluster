@@ -1,0 +1,18 @@
+{
+  "Comment": "Redis Cluster DNS entry",
+  "Changes": [
+    {
+      "Action": "%action%",
+      "ResourceRecordSet": {
+        "Name": "redis-cluster.%domain%",
+        "Type": "A",
+        "TTL": 60,
+        "ResourceRecords": [
+          {
+            "Value": "%ipaddr%"
+          }
+        ]
+      }
+    }
+  ]
+}
